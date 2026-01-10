@@ -55,33 +55,44 @@ async def load_assets():
     assets = await db.assets.find().to_list(None)
     ASSETS = {str(asset["_id"]): asset.get("meta", {}).get("UN", f"Asset {asset['_id']}") for asset in assets}
 
+
+# TODO processing of txs that expiring by requesting db.txs with statuses [1,5 ...] and tx_status(tx_id)
 async def process_transactions():
     """Processes and updates transactions in the database."""
     limit = 100
     skip = 0
+    seq_count = 0
     while True:
         # Fetch transactions from the API
-        transactions = sorted(beam_api.tx_list(skip=skip, count=limit), key=lambda x: x['create_time'])  # Get all transactions
+        transactions = beam_api.tx_list(skip=skip, count=limit)#, key=lambda x: x['create_time'])  # Get all transactions
         if not transactions:
             return
         skip += len(transactions)
 
         for tx in transactions:
             try:
-
                 tx_id = tx["txId"]
                 asset_id = str(tx["asset_id"])  # Convert asset_id to string for MongoDB keys
                 value = int(tx["value"])  # Use integers for calculations
                 fee = int(tx["fee"])  # Use integers for fee
                 status = tx["status"]
+                kernel = tx.get("kernel", None)
                 confirmations = tx.get("confirmations", 0)
+                comment = tx.get("comment", "")
+
+                if seq_count >= 20:
+                    return
 
                 # Fetch existing transaction from the database
                 existing_tx = await db.txs.find_one({"_id": tx_id})
 
                 # Skip if the transaction has already been successfully processed
                 if existing_tx and existing_tx.get("success", False):
+                    seq_count += 1
+                    #print("seq_count += 1", seq_count)
                     continue
+
+                seq_count = 0
 
                 if existing_tx:
                     update_fields = {}
@@ -112,7 +123,7 @@ async def process_transactions():
                         # Mark transaction as successfully processed
                         await db.txs.update_one(
                             {"_id": tx_id},
-                            {"$set": {"success": True}}
+                            {"$set": {"success": True, "kernel": kernel}}
                         )
 
                 elif status in [1, 3, 5]:
@@ -131,16 +142,17 @@ async def process_transactions():
                         "receiver": tx["receiver"],
                         "sender_identity": tx.get("sender_identity", ""),
                         "receiver_identity": tx.get("receiver_identity", ""),
-                        "comment": tx.get("comment", ""),
+                        "comment": comment,
                         "create_time": int(tx["create_time"]),
                         "confirmations": confirmations,
-                        "kernel": tx.get("kernel", ""),
+                        "kernel": kernel,
                         "failure_reason": tx.get("failure_reason", ""),
                         "rates": tx.get("rates", []),
                         "success": False,  # Initial state. If fully checked.
                         "webhook_sent": {}
                     }
                     await db.txs.insert_one(tx_data)
+                    print("NEW_TRANSCATION", comment, tx.get("comment", ""), asset_id, value)
 
                     # Get human-readable asset name
                     try:
@@ -207,6 +219,7 @@ async def handle_finalized_transaction(tx):
     asset_name = ASSETS.get(asset_id, f"??? {asset_id}")
 
     # Format value
+
     value_formatted = f"{value / 10**8:,.8f}"  # Assuming 8 decimal places
 
 
@@ -267,27 +280,42 @@ async def handle_failed_transaction(tx):
     pending_tx = await db.pending_withdrawals.find_one({"txId": tx_id})
     if pending_tx:
         # Mark withdrawal as "pending" (allow send it again)
-        await db.pending_withdrawals.update_one(
-            {"txId": tx_id},
-            {"$set": {"status": "failed"}}
-        )
-        await db.txs.update_one(
-            {"_id": tx_id},
-            {"$set": {"success": True}}
-        )
-        await send_to_logs(
-            f"❌ *Withdrawal Failed*\n"
-            f"🔗 *From:* `{sender}` ➡ *To:* `{receiver}`\n"
-            f"💰 *Amount:* `{value/ 10**8:,.8f} {ASSETS.get(str(asset_id), '???')}`\n"
-            f"🆔 *Pending TX:* `{tx_id}`",
-            parse_mode="Markdown"
-        )
-        sender_exists = await db.addresses.find_one({"_id": sender})
-        if sender_exists:
-            # Refund locked funds and BEAM fee back to sender
-            await update_balance(sender, asset_id, available_delta=value, locked_delta=-value)
-            await update_balance(sender, "0", available_delta=fee, locked_delta=-fee)  # Refund BEAM fee
-        return
+        if tx['status'] == 4:
+            await db.pending_withdrawals.update_one(
+                {"txId": tx_id},
+                {"$set": {"status": "failed"}}
+            )
+            await db.txs.update_one(
+                {"_id": tx_id},
+                {"$set": {"success": True}}
+            )
+            await send_to_logs(
+                f"❌ *Withdrawal Failed*\n"
+                f"🔗 *From:* `{sender}` ➡ *To:* `{receiver}`\n"
+                f"💰 *Amount:* `{value/ 10**8:,.8f} {ASSETS.get(str(asset_id), '???')}`\n"
+                f"🆔 *Pending TX:* `{tx_id}`",
+                parse_mode="Markdown"
+            )
+            sender_exists = await db.addresses.find_one({"_id": sender})
+            if sender_exists:
+                # Refund locked funds and BEAM fee back to sender
+                await update_balance(sender, asset_id, available_delta=value, locked_delta=-value)
+                await update_balance(sender, "0", available_delta=fee, locked_delta=-fee)  # Refund BEAM fee
+            return
+        else:
+            await db.pending_withdrawals.update_one(
+                {"txId": tx_id},
+                {"$set": {"status": "pending"}}
+            )
+            await send_to_logs(
+                f"❌ *Withdrawal Failed* - RETRYING\n"
+                f"🔗 *From:* `{sender}` ➡ *To:* `{receiver}`\n"
+                f"💰 *Amount:* `{value/ 10**8:,.8f} {ASSETS.get(str(asset_id), '???')}`\n"
+                f"🆔 *Pending TX:* `{tx_id}`",
+                parse_mode="Markdown"
+            )
+            return
+    
 
     receiver_exists = await db.addresses.find_one({"_id": receiver})
     if receiver_exists:
@@ -520,8 +548,7 @@ async def sync_assets():
                 except Exception as e:
                     print(f"⚠️ Error parsing DEX asset data: {e}")
 
-        # 3️⃣ Fetch liquidity pools & update asset rates (if DEX enabled)
-        if DEX_CONTRACT_ID:
+            # 3️⃣ Fetch liquidity pools & update asset rates (if DEX enabled)
             await sync_liquidity_pools()
 
         # 4️⃣ Fetch & Overwrite CA Metadata from External JSON File
@@ -588,9 +615,11 @@ async def process_assets(assets, is_dex=False):
             await db.assets.update_one({"_id": asset_id}, {"$set": asset_data})
         else:
             await db.assets.insert_one(asset_data)
+            await send_to_logs(f"✅ Inserted new asset {asset_id}")
             print(f"✅ Inserted new asset {asset_id}")
 
     print(f"✅ Processed {len(assets)} assets ({'DEX' if is_dex else 'Blockchain'})")
+
 
 async def sync_liquidity_pools():
     """
@@ -603,7 +632,6 @@ async def sync_liquidity_pools():
     try:
         print("🔄 Fetching liquidity pools from DEX...")
 
-        # Call the DEX contract
         pools_response = beam_api.invoke_contract(
             contract_file="./dapps/dex_app.wasm",
             args=f"role=manager,action=pools_view,cid={DEX_CONTRACT_ID}"
@@ -612,7 +640,7 @@ async def sync_liquidity_pools():
         if not pools_response or "output" not in pools_response:
             print("⚠️ No response from DEX pools.")
             return
-        
+
         pools_data = json.loads(pools_response["output"]).get("res", [])
 
         if not pools_data:
@@ -623,49 +651,58 @@ async def sync_liquidity_pools():
         beam_price_data = await db.price.find_one({"_id": "beam_usd"})
         beam_price = float(beam_price_data["price"]) if beam_price_data else 0
 
-        # Dictionary to store updates
         asset_updates = {}
+        MIN_USD_LIQUIDITY = 100  # 💰 Minimum pool size in $ to consider rate valid
+
 
         for pool in pools_data:
             aid1, aid2 = str(pool["aid1"]), str(pool["aid2"])
-
-            # Get rates
+            beam_liquidity_groths = int(pool["tok1"]) if pool["aid1"] == 0 else int(pool["tok2"])
+            beam_liquidity_beam = beam_liquidity_groths / 1e8  # convert from groths
+            beam_liquidity_usd = beam_liquidity_beam * beam_price
+        
             rate1_2 = float(pool.get("k1_2", 0))
             rate2_1 = float(pool.get("k2_1", 0))
+        
+            rate_beam_1 = rate_beam_2 = None
+            rate1_usd = rate2_usd = None
+        
+            if aid1 == "0":  # BEAM -> Asset
+                if beam_liquidity_usd >= MIN_USD_LIQUIDITY:
+                    rate_beam_2 = rate1_2
+                    rate2_usd = rate_beam_2 * beam_price
+                else:
+                    print(f"⚠️ Skipping asset {aid2} - BEAM liquidity too low: ${beam_liquidity_usd:.2f}")
+            elif aid2 == "0":  # Asset -> BEAM
+                if beam_liquidity_usd >= MIN_USD_LIQUIDITY:
+                    rate_beam_1 = rate2_1
+                    rate1_usd = rate_beam_1 * beam_price
+                else:
+                    print(f"⚠️ Skipping asset {aid1} - BEAM liquidity too low: ${beam_liquidity_usd:.2f}")
+        
+            if rate_beam_1:
+                asset_updates[aid1] = {
+                    f"rate_{aid1}_{aid2}": str(rate1_2),
+                    "rate_beam": str(rate_beam_1),
+                    "rate_usd": str(rate1_usd)
+                }
+                print(f"1 🔹 Asset {aid1}: 1 {aid1} = {rate_beam_1:.8f} BEAM (~${rate1_usd:.8f}); BEAM liquidity: ${beam_liquidity_usd:.2f}")
+        
+            if rate_beam_2:
+                asset_updates[aid2] = {
+                    f"rate_{aid2}_{aid1}": str(rate2_1),
+                    "rate_beam": float(rate_beam_2),
+                    "rate_usd": float(rate2_usd)
+                }
+                print(f"{aid1}/{aid2} 🔹 Asset {aid2}: 1 {aid2} = {rate_beam_2:.8f} BEAM (~${rate2_usd:.8f}); BEAM liquidity: ${beam_liquidity_usd:.2f}")
+                await db.assets.update_one({"_id": aid2}, {"$set": {"rate_usd": str(rate2_usd), "rate_beam": str(rate_beam_2), f"rate_{aid2}_{aid1}": str(rate2_1)}})
 
-            # BEAM Price Calculation
-            rate_beam_1, rate_beam_2 = None, None
-            if aid1 == "0":
-                rate_beam_2 = rate1_2
-            elif aid2 == "0":
-                rate_beam_1 = rate2_1
 
-            # USD Pricing
-            rate1_usd, rate2_usd = None, None
-            if beam_price > 0:
-                rate1_usd = rate_beam_1 * beam_price if rate_beam_1 else None
-                rate2_usd = rate_beam_2 * beam_price if rate_beam_2 else None
-
-            # Store price conversions in each asset
-            asset_updates[aid1] = {
-                f"rate_{aid1}_{aid2}": str(rate1_2),
-                "rate_beam": str(rate_beam_1) if rate_beam_1 else None,
-                "rate_usd": str(rate1_usd) if rate1_usd else None
-            }
-
-            asset_updates[aid2] = {
-                f"rate_{aid2}_{aid1}": str(rate2_1),
-                "rate_beam": str(rate_beam_2) if rate_beam_2 else None,
-                "rate_usd": str(rate2_usd) if rate2_usd else None
-            }
-
-        # Batch update asset prices
+        # Batch update
         asset_update_queries = [
             db.assets.update_one({"_id": aid}, {"$set": data}, upsert=True)
             for aid, data in asset_updates.items()
         ]
-
-        # Execute all updates in parallel
         await asyncio.gather(*asset_update_queries)
 
         print("✅ Liquidity pools synchronized successfully.")
@@ -673,6 +710,7 @@ async def sync_liquidity_pools():
     except Exception as e:
         print(f"❌ Error syncing liquidity pools: {e}")
         traceback.print_exc()
+
 
 
 async def process_withdrawal_queue():
@@ -686,6 +724,7 @@ async def process_withdrawal_queue():
             amount = int(tx["value"])
             fee = int(tx["fee"])
             receiver = tx["receiver"]
+            kernel = tx.get('kernel', "")
             comment = tx.get('comment', "")
 
             # TUDO Double check SENDER's address balance and math.
@@ -698,7 +737,9 @@ async def process_withdrawal_queue():
             locked_beam = int(sender_data["balance"]["locked"].get("0", "0"))
 
             # Validate Locked Balance Matches Pending Withdrawals
-            pending_withdrawals = await db.pending_withdrawals.find({"sender": sender, "status": {"$ne": "sent_confirmed"}}).to_list(None)
+            pending_withdrawals = await db.pending_withdrawals.find({"sender": sender, 
+                                                                     "status": {"$nin": ["sent_confirmed", "failed"]}
+                                                                     }).to_list(None)
             pending_total = 0
             pending_beam_fees = 0  # Separate BEAM fee total
             total_pending_beam = 0
@@ -735,7 +776,7 @@ async def process_withdrawal_queue():
 
 
             # 🔹 Fetch UTXOs & Check Balance Again
-            utxos = beam_api.get_utxo(count=100, sort_field="status", sort_direction="asc", filter={"asset_id": int(asset_id)})
+            utxos = beam_api.get_utxo(count=1000, sort_field="spentTxId", sort_direction="asc", filter={"asset_id": int(asset_id)})
             available_utxo_amount = sum(utxo["amount"] for utxo in utxos if utxo["status"] == 1)  # Only 'available' UTXOs
 
             print("AVAILABLE UTXOs", available_utxo_amount)
@@ -802,6 +843,7 @@ async def process_withdrawal_queue():
                 "fee": str(fee),
                 "sender": sender,
                 "receiver": receiver,
+                "kernel": kernel,
                 "create_time": datetime.datetime.utcnow().timestamp(),
                 "confirmations": 0,
                 "success": False,
@@ -835,7 +877,7 @@ async def process_updates():
             await load_assets()
             await verify_balances()
             await sync_addresses()
-            await asyncio.sleep(120)
+            #await asyncio.sleep(120)
         except Exception as exc:
             traceback.print_exc()
             await send_to_logs(traceback.format_exc())
